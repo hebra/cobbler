@@ -58,35 +58,37 @@ fn env_u16(key: &str, fallback: u16) -> u16 {
 }
 
 fn hostname_or_unknown() -> String {
-    let mut buf = vec![0u8; 256];
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len()) };
-    if rc != 0 {
-        return "unknown".to_string();
-    }
-
-    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8) };
-    let hostname = cstr.to_string_lossy().trim().to_string();
-    if hostname.is_empty() {
-        "unknown".to_string()
-    } else {
-        hostname
-    }
+    std::env::var("COBBLER_DAEMON_HOSTNAME")
+        .unwrap_or_else(|_| {
+            gethostname::gethostname().to_string_lossy().into_owned()
+        })
+        .trim_end_matches('.')
+        .to_string()
 }
 
 fn register_mdns(port: u16, hostname: &str) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
-        Ok(daemon) => daemon,
+        Ok(daemon) => {
+            eprintln!("mDNS daemon started");
+            daemon
+        }
         Err(err) => {
-            eprintln!("mDNS disabled: {err}");
+            eprintln!("FAILED to start mDNS daemon: {err}");
             return None;
         }
     };
 
-    let instance = format!("cobblerd-{hostname}");
-    let host_name = format!("{hostname}.local.");
+    let instance_hostname = hostname.split('.').next().unwrap_or(hostname);
+    let instance = format!("cobblerd-{instance_hostname}");
+    let host_name = format!("{instance_hostname}.local.");
     let properties = [("id", hostname)];
 
-    let info = match ServiceInfo::new(
+    eprintln!("Registering mDNS service:");
+    eprintln!("  Instance: {}", instance);
+    eprintln!("  Host: {}", host_name);
+    eprintln!("  Port: {}", port);
+
+    let mut info = match ServiceInfo::new(
         "_cobbler._tcp.local.",
         &instance,
         &host_name,
@@ -94,18 +96,44 @@ fn register_mdns(port: u16, hostname: &str) -> Option<ServiceDaemon> {
         port,
         &properties[..],
     ) {
-        Ok(info) => info.enable_addr_auto(),
+        Ok(info) => {
+            eprintln!("mDNS service info created");
+            info
+        }
         Err(err) => {
-            eprintln!("mDNS disabled: {err}");
+            eprintln!("FAILED to create mDNS service info: {err}");
             return None;
         }
     };
 
+    if let Ok(ip) = std::env::var("COBBLER_DAEMON_IP") {
+        eprintln!("Using explicit IP from COBBLER_DAEMON_IP: {}", ip);
+        let ip_addr: std::net::IpAddr = ip.parse().expect("invalid COBBLER_DAEMON_IP");
+        info = match ServiceInfo::new(
+            "_cobbler._tcp.local.",
+            &instance,
+            &host_name,
+            ip_addr,
+            port,
+            &properties[..],
+        ) {
+            Ok(info) => info,
+            Err(err) => {
+                eprintln!("FAILED to create mDNS service info with explicit IP: {err}");
+                return None;
+            }
+        };
+    } else {
+        eprintln!("Enabling automatic address discovery");
+        info = info.enable_addr_auto();
+    }
+
     if let Err(err) = daemon.register(info) {
-        eprintln!("mDNS disabled: {err}");
+        eprintln!("FAILED to register mDNS service: {err}");
         return None;
     }
 
+    eprintln!("mDNS service registered successfully");
     Some(daemon)
 }
 

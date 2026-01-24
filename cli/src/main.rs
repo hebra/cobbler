@@ -91,11 +91,21 @@ fn run_discover(args: &[String]) -> Result<(), Box<dyn Error>> {
         let remaining = deadline - now;
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    let fullname = info.get_fullname().to_string();
-                    if seen.insert(fullname) {
-                        results.push(info);
+                match event {
+                    ServiceEvent::ServiceFound(service_type, fullname) => {
+                        eprintln!("Found new service: {} (type: {})", fullname, service_type);
                     }
+                    ServiceEvent::ServiceResolved(info) => {
+                        eprintln!("Resolved service: {}", info.get_fullname());
+                        let fullname = info.get_fullname().to_string();
+                        if seen.insert(fullname) {
+                            results.push(info);
+                        }
+                    }
+                    ServiceEvent::SearchStopped(service_type) => {
+                        eprintln!("Search stopped for {}", service_type);
+                    }
+                    _ => {}
                 }
             }
             Err(RecvTimeoutError::Timeout) => break,
@@ -134,7 +144,7 @@ fn run_discover(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_discover_args(args: &[String]) -> Result<Duration, Box<dyn Error>> {
-    let mut timeout = Duration::from_secs(3);
+    let mut timeout = Duration::from_secs(5);
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -172,7 +182,7 @@ fn print_discover_help(out: &mut dyn Write) {
     writeln!(out, "Options:").ok();
     writeln!(
         out,
-        "  -timeout duration   time to wait for responses (default 3s)"
+        "  -timeout duration   time to wait for responses (default 5s)"
     )
     .ok();
 }

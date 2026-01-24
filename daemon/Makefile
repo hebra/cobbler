@@ -1,4 +1,7 @@
-.PHONY: build run check fmt clippy clean
+.PHONY: build run check fmt clippy clean container
+
+CONTAINER_TOOL ?= podman
+IMAGE_NAME ?= cobblerd
 
 build:
 	cargo build
@@ -17,3 +20,7 @@ clippy:
 
 clean:
 	cargo clean
+
+container:
+	$(CONTAINER_TOOL) build -t $(IMAGE_NAME) -f Containerfile .
+	$(CONTAINER_TOOL) run --rm --network bridge -p 8080:8080 -p 5353:5353 --name cobblerd $(IMAGE_NAME)

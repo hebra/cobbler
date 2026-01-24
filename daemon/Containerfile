@@ -1,0 +1,11 @@
+FROM rust:1.93-alpine AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
+FROM ubuntu:24.04
+
+COPY --from=builder /app/target/release/cobblerd /usr/local/bin/cobblerd
+ENTRYPOINT ["/usr/local/bin/cobblerd"]
