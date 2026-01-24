@@ -332,12 +332,22 @@ fn run_status(args: &[String]) -> Result<(), Box<dyn Error>> {
 
         let status_url = format!("{}/status", url);
 
-        let status = match client.get(&status_url).send() {
-            Ok(resp) => resp.status().to_string(),
-            Err(err) => format!("Error: {}", err),
+        let (status, body) = match client.get(&status_url).send() {
+            Ok(resp) => {
+                let status = resp.status().to_string();
+                let body = match resp.json::<serde_json::Value>() {
+                    Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                    Err(_) => "Could not parse response as JSON".to_string(),
+                };
+                (status, body)
+            }
+            Err(err) => (format!("Error: {}", err), "".to_string()),
         };
 
         writeln!(tw, "{}\t{}", target, status)?;
+        if !body.is_empty() {
+            writeln!(tw, "\t{}", body.replace('\n', "\n\t"))?;
+        }
     }
 
     tw.flush()?;

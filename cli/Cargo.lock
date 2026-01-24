@@ -62,6 +62,7 @@ dependencies = [
  "humantime",
  "mdns-sd",
  "reqwest",
+ "serde_json",
  "tabwriter",
 ]
 
