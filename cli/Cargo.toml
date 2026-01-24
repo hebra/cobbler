@@ -1,0 +1,10 @@
+[package]
+name = "cobbler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+humantime = "2.1"
+flume = "0.10"
+mdns-sd = "0.9"
+tabwriter = "1.4"

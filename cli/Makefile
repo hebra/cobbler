@@ -1,23 +1,20 @@
-.PHONY: all build run test tidy fmt clean
+.PHONY: all build run test fmt clean
 
 BINARY := cobbler
 
 all: build
 
 build:
-	go build -o bin/$(BINARY) ./cmd/$(BINARY)
+	cargo build
 
 run:
-	go run ./cmd/$(BINARY)
+	cargo run --bin $(BINARY)
 
 test:
-	go test ./...
-
-tidy:
-	go mod tidy
+	cargo test
 
 fmt:
-	go fmt ./...
+	cargo fmt
 
 clean:
-	rm -rf bin
+	cargo clean

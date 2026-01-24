@@ -1,23 +1,19 @@
-.PHONY: all build run test tidy fmt clean
-
-BINARY := cobblerd
-
-all: build
+.PHONY: build run check fmt clippy clean
 
 build:
-	go build -o bin/$(BINARY) ./cmd/$(BINARY)
+	cargo build
 
 run:
-	go run ./cmd/$(BINARY)
+	cargo run
 
-test:
-	go test ./...
-
-tidy:
-	go mod tidy
+check:
+	cargo check
 
 fmt:
-	go fmt ./...
+	cargo fmt
+
+clippy:
+	cargo clippy -- -D warnings
 
 clean:
-	rm -rf bin
+	cargo clean

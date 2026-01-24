@@ -2,3 +2,4 @@
 /.envrc
 /.idea
 bin/
+target/

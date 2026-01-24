@@ -1,0 +1,10 @@
+[package]
+name = "cobblerd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.7"
+libc = "0.2"
+mdns-sd = "0.9.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
