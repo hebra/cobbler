@@ -25,6 +25,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "status" => {
+            if let Err(err) = run_status(&args[2..]) {
+                eprintln!("status: {err}");
+                std::process::exit(1);
+            }
+        }
         other => {
             eprintln!("unknown command: {other}");
             eprintln!();
@@ -45,6 +51,10 @@ fn run_help(args: &[String]) {
             let mut out = io::stdout();
             print_discover_help(&mut out);
         }
+        "status" => {
+            let mut out = io::stdout();
+            print_status_help(&mut out);
+        }
         "help" => print_help(),
         other => {
             eprintln!("unknown command: {other}");
@@ -61,6 +71,7 @@ fn print_help() {
     println!("Commands:");
     println!("  help [command]  Show help for a command");
     println!("  discover        Discover cobbler daemons on the local network");
+    println!("  status          Show status of cobbler daemons");
     println!();
     println!("Run `cobbler help <command>` for details.");
 }
@@ -222,4 +233,126 @@ fn entry_instance(entry: &ServiceInfo) -> String {
         .strip_suffix(&suffix)
         .unwrap_or(fullname)
         .to_string()
+}
+
+fn run_status(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut targets = Vec::new();
+    let mut discover_all = false;
+
+    if args.is_empty() {
+        let mut out = io::stderr();
+        print_status_help(&mut out);
+        return Ok(());
+    }
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-a" | "--all" => {
+                discover_all = true;
+            }
+            "-h" | "--help" => {
+                let mut out = io::stdout();
+                print_status_help(&mut out);
+                return Ok(());
+            }
+            target if !target.starts_with('-') => {
+                targets.push(target.to_string());
+            }
+            other => {
+                return Err(format!("unknown option: {other}").into());
+            }
+        }
+        i += 1;
+    }
+
+    if discover_all {
+        let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
+        let service_name = format!("{}.{}", SERVICE_TYPE.trim_end_matches('.'), SERVICE_DOMAIN);
+        let receiver = mdns
+            .browse(&service_name)
+            .map_err(|err| format!("browse: {err}"))?;
+
+        let timeout = Duration::from_secs(2);
+        let deadline = Instant::now() + timeout;
+        let mut seen = HashSet::new();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            let remaining = deadline - now;
+            match receiver.recv_timeout(remaining) {
+                Ok(event) => {
+                    if let ServiceEvent::ServiceResolved(info) = event {
+                        for addr in info.get_addresses() {
+                            let target = format!("{}:{}", addr, info.get_port());
+                            if seen.insert(target.clone()) {
+                                targets.push(target);
+                            }
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(err) => return Err(format!("mDNS error: {err}").into()),
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        println!("No targets found.");
+        return Ok(());
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+
+    let mut tw = TabWriter::new(io::stdout());
+    writeln!(tw, "TARGET\tSTATUS")?;
+
+    for target in targets {
+        let url = if target.starts_with("http://") || target.starts_with("https://") {
+            target.trim_end_matches('/').to_string()
+        } else if target.contains(':') && target.split(':').last().unwrap().chars().all(|c| c.is_ascii_digit()) {
+            let parts: Vec<&str> = target.split(':').collect();
+            let host = parts[..parts.len()-1].join(":");
+            let port = parts.last().unwrap();
+            
+            if host.contains(':') && !host.starts_with('[') {
+                format!("http://[{}]:{}", host, port)
+            } else {
+                format!("http://{}:{}", host, port)
+            }
+        } else {
+            format!("http://{}", target.trim_end_matches('/'))
+        };
+
+        let status_url = format!("{}/status", url);
+
+        let status = match client.get(&status_url).send() {
+            Ok(resp) => resp.status().to_string(),
+            Err(err) => format!("Error: {}", err),
+        };
+
+        writeln!(tw, "{}\t{}", target, status)?;
+    }
+
+    tw.flush()?;
+
+    Ok(())
+}
+
+fn print_status_help(out: &mut dyn Write) {
+    writeln!(out, "Usage: cobbler status [options] [host:port]").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Options:").unwrap();
+    writeln!(out, "  -a, --all    Get status for all discovered cobbler daemons").unwrap();
+    writeln!(out, "  -h, --help   Show this help message").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Examples:").unwrap();
+    writeln!(out, "  cobbler status -a").unwrap();
+    writeln!(out, "  cobbler status localhost:8080").unwrap();
 }
