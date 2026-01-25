@@ -9,6 +9,13 @@ use tabwriter::TabWriter;
 const SERVICE_TYPE: &str = "_cobbler._tcp";
 const SERVICE_DOMAIN: &str = "local.";
 
+fn get_default_timeout() -> Duration {
+    std::env::var("COBBLER_TIMEOUT")
+        .ok()
+        .and_then(|v| humantime::parse_duration(&v).ok())
+        .unwrap_or(Duration::from_secs(60))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -155,7 +162,7 @@ fn run_discover(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_discover_args(args: &[String]) -> Result<Duration, Box<dyn Error>> {
-    let mut timeout = Duration::from_secs(5);
+    let mut timeout = get_default_timeout();
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -193,9 +200,10 @@ fn print_discover_help(out: &mut dyn Write) {
     writeln!(out, "Options:").ok();
     writeln!(
         out,
-        "  -timeout duration   time to wait for responses (default 5s)"
+        "  -timeout duration   time to wait for responses (default 60s)"
     )
     .ok();
+    writeln!(out, "                      The default can be overridden with COBBLER_TIMEOUT.").ok();
 }
 
 fn entry_id(entry: &ServiceInfo) -> String {
@@ -273,7 +281,7 @@ fn run_status(args: &[String]) -> Result<(), Box<dyn Error>> {
             .browse(&service_name)
             .map_err(|err| format!("browse: {err}"))?;
 
-        let timeout = Duration::from_secs(2);
+        let timeout = get_default_timeout();
         let deadline = Instant::now() + timeout;
         let mut seen = HashSet::new();
 
@@ -307,7 +315,7 @@ fn run_status(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(get_default_timeout())
         .build()?;
 
     let mut tw = TabWriter::new(io::stdout());
@@ -361,6 +369,9 @@ fn print_status_help(out: &mut dyn Write) {
     writeln!(out, "Options:").unwrap();
     writeln!(out, "  -a, --all    Get status for all discovered cobbler daemons").unwrap();
     writeln!(out, "  -h, --help   Show this help message").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "Environment variables:").unwrap();
+    writeln!(out, "  COBBLER_TIMEOUT  Default timeout for network operations (default 60s)").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "Examples:").unwrap();
     writeln!(out, "  cobbler status -a").unwrap();
