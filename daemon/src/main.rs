@@ -25,14 +25,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let http_port = env_u16("COBBLER_DAEMON_PORT", DEFAULT_HTTP_PORT);
-    let hostname = hostname_or_unknown();
+    let port_env = std::env::var("COBBLER_DAEMON_PORT").ok();
+    let (listener, http_port) = if let Some(port_str) = port_env {
+        let port = port_str.parse::<u16>().map_err(|e| {
+            error!("invalid COBBLER_DAEMON_PORT={port_str:?}: {e}");
+            e
+        })?;
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = TcpListener::bind(addr).await.map_err(|e| {
+            error!("failed to bind to port {port}: {e}");
+            e
+        })?;
+        (listener, port)
+    } else {
+        let mut port = DEFAULT_HTTP_PORT;
+        loop {
+            let addr = SocketAddr::from(([0, 0, 0, 0], port));
+            match TcpListener::bind(addr).await {
+                Ok(listener) => break (listener, port),
+                Err(e) => {
+                    if port == u16::MAX {
+                        error!("no free ports found");
+                        return Err(e.into());
+                    }
+                    warn!("port {port} is already in use, trying {}...", port + 1);
+                    port += 1;
+                }
+            }
+        }
+    };
 
+    let hostname = hostname_or_unknown();
     let mdns_daemon = register_mdns(http_port, &hostname);
 
     let app = Router::new().route("/status", get(status_handler));
-    let addr = SocketAddr::from(([0, 0, 0, 0], http_port));
-    let listener = TcpListener::bind(addr).await?;
 
     info!(
         "cobbler daemon listening on {}",
@@ -139,20 +165,6 @@ fn get_apt_updates() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(vec![])
 }
 
-fn env_u16(key: &str, fallback: u16) -> u16 {
-    let value = std::env::var(key).ok();
-    let Some(value) = value.filter(|value| !value.is_empty()) else {
-        return fallback;
-    };
-
-    match value.parse::<u16>() {
-        Ok(parsed) => parsed,
-        Err(_) => {
-            warn!("invalid {key}={value:?}, using {fallback}");
-            fallback
-        }
-    }
-}
 
 fn hostname_or_unknown() -> String {
     std::env::var("COBBLER_DAEMON_HOSTNAME")
@@ -294,5 +306,56 @@ mod tests {
             assert_eq!(status.message, "the system is not a Debian-based Linux system");
             assert!(status.updates.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_port_hunting() {
+        use tokio::net::TcpListener;
+        
+        // Bind to a random port first to simulate it being in use
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        
+        // Now try to find a port starting from bound_port. It should find bound_port + 1.
+        let mut port = bound_port;
+        let found_listener = loop {
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            match TcpListener::bind(addr).await {
+                Ok(l) => break l,
+                Err(_) => {
+                    port += 1;
+                }
+            }
+        };
+        
+        assert_eq!(port, bound_port + 1);
+        assert_eq!(found_listener.local_addr().unwrap().port(), bound_port + 1);
+        
+        drop(listener);
+        drop(found_listener);
+    }
+
+    #[tokio::test]
+    async fn test_port_fail_if_env_set() {
+        use tokio::net::TcpListener;
+        
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        
+        // Set environment variable
+        unsafe { std::env::set_var("COBBLER_DAEMON_PORT", bound_port.to_string()); }
+        
+        let port_env = std::env::var("COBBLER_DAEMON_PORT").ok();
+        assert!(port_env.is_some());
+        
+        let port_str = port_env.unwrap();
+        let port = port_str.parse::<u16>().unwrap();
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let result = TcpListener::bind(addr).await;
+        
+        assert!(result.is_err());
+        
+        unsafe { std::env::remove_var("COBBLER_DAEMON_PORT"); }
+        drop(listener);
     }
 }
