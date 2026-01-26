@@ -1,18 +1,34 @@
-use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
+#[derive(Clone)]
+struct AppState {
+    is_upgrading: Arc<AtomicBool>,
+}
+
 #[derive(Serialize, serde::Deserialize)]
 struct StatusResponse {
     message: String,
     updates: Vec<String>,
+    is_upgrading: bool,
 }
 
 #[tokio::main]
@@ -58,7 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hostname = hostname_or_unknown();
     let mdns_daemon = register_mdns(http_port, &hostname);
 
-    let app = Router::new().route("/status", get(status_handler));
+    let state = AppState {
+        is_upgrading: Arc::new(AtomicBool::new(false)),
+    };
+
+    let app = Router::new()
+        .route("/status", get(status_handler))
+        .route("/packages/full-upgrade", post(full_upgrade_handler))
+        .with_state(state);
 
     info!(
         "cobbler daemon listening on {}",
@@ -82,13 +105,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn status_handler() -> impl IntoResponse {
+async fn status_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let is_upgrading = state.is_upgrading.load(Ordering::SeqCst);
     if !is_apt_available() {
         return (
             StatusCode::PRECONDITION_FAILED,
             Json(StatusResponse {
                 message: "the system is not a Debian-based Linux system".to_string(),
                 updates: Vec::new(),
+                is_upgrading,
             }),
         );
     }
@@ -106,6 +131,7 @@ async fn status_handler() -> impl IntoResponse {
                 Json(StatusResponse {
                     message,
                     updates,
+                    is_upgrading,
                 }),
             )
         }
@@ -114,9 +140,66 @@ async fn status_handler() -> impl IntoResponse {
             Json(StatusResponse {
                 message: format!("Failed to check for updates: {}", err),
                 updates: Vec::new(),
+                is_upgrading,
             }),
         ),
     }
+}
+
+async fn full_upgrade_handler(State(state): State<AppState>) -> impl IntoResponse {
+    if !is_apt_available() {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "message": "the system is not a Debian-based Linux system"
+            })),
+        );
+    }
+
+    if state
+        .is_upgrading
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            Json(serde_json::json!({
+                "message": "a full upgrade is currently running"
+            })),
+        );
+    }
+
+    tokio::spawn(async move {
+        info!("starting full upgrade");
+        let output = Command::new("apt")
+            .args(["full-upgrade", "-y"])
+            .output();
+
+        match output {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("full upgrade completed successfully");
+                } else {
+                    error!(
+                        "full upgrade failed with status: {}. stderr: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+            Err(e) => {
+                error!("failed to execute full upgrade: {e}");
+            }
+        }
+        state.is_upgrading.store(false, Ordering::SeqCst);
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": "full upgrade triggered"
+        })),
+    )
 }
 
 fn is_apt_available() -> bool {
@@ -286,8 +369,12 @@ mod tests {
         // This test will likely run on non-linux (macOS) in this environment
         // but we can't easily fake the output of `Command::new("apt")` without mocking.
         // For now, let's just ensure it compiles and runs.
-        
-        let app = Router::new().route("/status", get(status_handler));
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+        };
+        let app = Router::new()
+            .route("/status", get(status_handler))
+            .with_state(state);
         
         let response = app
             .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
@@ -305,6 +392,78 @@ mod tests {
         {
             assert_eq!(status.message, "the system is not a Debian-based Linux system");
             assert!(status.updates.is_empty());
+            assert!(!status.is_upgrading);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_upgrade_handler_non_linux() {
+        let state = AppState {
+            is_upgrading: Arc::new(AtomicBool::new(false)),
+        };
+        let app = Router::new()
+            .route("/packages/full-upgrade", post(full_upgrade_handler))
+            .with_state(state);
+        
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/packages/full-upgrade")
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap();
+
+        // On macOS/Darwin, apt won't be available
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let res: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(res["message"], "the system is not a Debian-based Linux system");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_upgrade_flow() {
+        #[cfg(target_os = "linux")]
+        {
+            let state = AppState {
+                is_upgrading: Arc::new(AtomicBool::new(false)),
+            };
+            let app = Router::new()
+                .route("/status", get(status_handler))
+                .route("/packages/full-upgrade", post(full_upgrade_handler))
+                .with_state(state.clone());
+
+            // 1. Start upgrade
+            let response = app.clone()
+                .oneshot(Request::builder().method("POST").uri("/packages/full-upgrade").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(state.is_upgrading.load(Ordering::SeqCst));
+
+            // 2. Try starting upgrade again while one is running
+            let response = app.clone()
+                .oneshot(Request::builder().method("POST").uri("/packages/full-upgrade").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let error_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error_json["message"], "a full upgrade is currently running");
+
+            // 3. Check /status reflects is_upgrading: true
+            let response = app.clone()
+                .oneshot(Request::builder().uri("/status").body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+            assert!(status.is_upgrading);
         }
     }
 
