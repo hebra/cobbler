@@ -1,14 +1,60 @@
 use clap::{Parser, Subcommand};
 use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::error::Error;
+use std::fs;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
 const SERVICE_TYPE: &str = "_cobbler._tcp";
 const SERVICE_DOMAIN: &str = "local.";
+
+#[derive(Serialize, Deserialize, Default, Debug)]
+struct Config {
+    #[serde(default)]
+    nodes: Vec<NodeConfig>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct NodeConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+}
+
+fn resolve_config_path(explicit_path: Option<PathBuf>) -> (PathBuf, bool) {
+    if let Some(path) = explicit_path {
+        return (path, true);
+    }
+
+    let default_path = PathBuf::from(".cobbler.yaml");
+    if default_path.exists() {
+        (default_path, true)
+    } else {
+        (default_path, false)
+    }
+}
+
+fn load_config(path: &Path) -> Result<Config, Box<dyn Error>> {
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let content = fs::read_to_string(path)?;
+    let config = serde_yaml::from_str(&content)?;
+    Ok(config)
+}
+
+fn save_config(path: &Path, config: &Config) -> Result<(), Box<dyn Error>> {
+    let content = serde_yaml::to_string(config)?;
+    fs::write(path, content)?;
+    Ok(())
+}
 
 fn get_default_timeout() -> Duration {
     std::env::var("COBBLER_TIMEOUT")
@@ -26,6 +72,10 @@ fn get_default_timeout() -> Duration {
 #[command(name = "cobbler")]
 #[command(about = "A CLI tool for cobbler", long_about = None)]
 struct Cli {
+    /// Path to the configuration file
+    #[arg(short, long, env = "COBBLER_CONFIG")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -37,6 +87,10 @@ enum Commands {
         /// Time to wait for responses in seconds
         #[arg(short, long, default_value = "5", env = "COBBLER_TIMEOUT")]
         timeout: u64,
+
+        /// Create and/or update a config file with newly found daemons
+        #[arg(short = 'u', long = "update-config")]
+        update_config: bool,
     },
     /// Show status of cobbler daemons
     Status {
@@ -54,21 +108,42 @@ enum Commands {
         full_upgrade: bool,
 
         /// Targets (host:port)
-        #[arg(required = true, num_args = 1..)]
+        #[arg(num_args = 0..)]
         targets: Vec<String>,
     },
 }
 
 fn main() {
     let cli = Cli::parse();
+    let (config_path, config_exists) = resolve_config_path(cli.config);
+    let config = match load_config(&config_path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("error: failed to load config: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let result = match cli.command {
-        Commands::Discover { timeout } => run_discover(Duration::from_secs(timeout)),
-        Commands::Status { all, targets } => run_status(all, targets),
+        Commands::Discover {
+            timeout,
+            update_config,
+        } => run_discover(Duration::from_secs(timeout), update_config, &config_path),
+        Commands::Status { all, targets } => {
+            if targets.is_empty() && !all && !config_exists {
+                println!("No config file was found or set.");
+            }
+            run_status(all, targets, &config)
+        }
         Commands::Packages {
             full_upgrade,
             targets,
-        } => run_packages(full_upgrade, targets),
+        } => {
+            if targets.is_empty() && !config_exists {
+                println!("No config file was found or set.");
+            }
+            run_packages(full_upgrade, targets, &config)
+        }
     };
 
     if let Err(err) = result {
@@ -77,7 +152,11 @@ fn main() {
     }
 }
 
-fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
+fn run_discover(
+    timeout: Duration,
+    update_config: bool,
+    config_path: &Path,
+) -> Result<(), Box<dyn Error>> {
     println!("Discovery will take {} seconds", timeout.as_secs());
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!(
@@ -92,6 +171,7 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
     let mut seen = HashSet::new();
     let mut header_printed = false;
+    let mut discovered_addresses = Vec::new();
 
     let stdout = io::stdout();
     let mut writer = TabWriter::new(stdout).padding(2);
@@ -104,33 +184,35 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
 
         let remaining = deadline - now;
         match receiver.recv_timeout(remaining) {
-            Ok(event) => {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        let fullname = info.get_fullname().to_string();
-                        if seen.insert(fullname) {
-                            if !header_printed {
-                                writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tINSTANCE")?;
-                                header_printed = true;
-                            }
-                            writeln!(
-                                writer,
-                                "{}\t{}\t{}\t{}\t{}",
-                                entry_id(&info),
-                                entry_host(&info),
-                                entry_addresses(&info),
-                                info.get_port(),
-                                entry_instance(&info)
-                            )?;
-                            writer.flush()?;
+            Ok(event) => match event {
+                ServiceEvent::ServiceResolved(info) => {
+                    let fullname = info.get_fullname().to_string();
+                    if seen.insert(fullname) {
+                        if !header_printed {
+                            writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tINSTANCE")?;
+                            header_printed = true;
+                        }
+                        writeln!(
+                            writer,
+                            "{}\t{}\t{}\t{}\t{}",
+                            entry_id(&info),
+                            entry_host(&info),
+                            entry_addresses(&info),
+                            info.get_port(),
+                            entry_instance(&info)
+                        )?;
+                        writer.flush()?;
+
+                        for addr in info.get_addresses() {
+                            discovered_addresses.push(format!("{}:{}", addr, info.get_port()));
                         }
                     }
-                    ServiceEvent::SearchStopped(service_type) => {
-                        eprintln!("Search stopped for {}", service_type);
-                    }
-                    _ => {}
                 }
-            }
+                ServiceEvent::SearchStopped(service_type) => {
+                    eprintln!("Search stopped for {}", service_type);
+                }
+                _ => {}
+            },
             Err(RecvTimeoutError::Timeout) => break,
             Err(RecvTimeoutError::Disconnected) => {
                 return Err("browse: receiver disconnected".into());
@@ -142,6 +224,27 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
 
     if !header_printed {
         println!("No cobbler daemons found.");
+    }
+
+    if update_config {
+        let mut config = load_config(config_path)?;
+        let mut updated = false;
+        for addr in discovered_addresses {
+            if !config.nodes.iter().any(|n| n.address == addr) {
+                config.nodes.push(NodeConfig {
+                    name: None,
+                    address: addr,
+                    api_key: None,
+                });
+                updated = true;
+            }
+        }
+        if updated {
+            save_config(config_path, &config)?;
+            println!("Configuration updated: {}", config_path.display());
+        } else {
+            println!("No new daemons found to add to configuration.");
+        }
     }
 
     Ok(())
@@ -156,8 +259,13 @@ mod tests {
     #[test]
     fn test_cli_parse_discover_default() {
         let cli = Cli::parse_from(&["cobbler", "discover"]);
-        if let Commands::Discover { timeout } = cli.command {
+        if let Commands::Discover {
+            timeout,
+            update_config,
+        } = cli.command
+        {
             assert_eq!(timeout, 5);
+            assert!(!update_config);
         } else {
             panic!("Wrong command");
         }
@@ -165,12 +273,28 @@ mod tests {
 
     #[test]
     fn test_cli_parse_discover_timeout() {
-        let cli = Cli::parse_from(&["cobbler", "discover", "-t", "10"]);
-        if let Commands::Discover { timeout } = cli.command {
+        let cli = Cli::parse_from(&["cobbler", "discover", "-t", "10", "-u"]);
+        if let Commands::Discover {
+            timeout,
+            update_config,
+        } = cli.command
+        {
             assert_eq!(timeout, 10);
+            assert!(update_config);
         } else {
             panic!("Wrong command");
         }
+    }
+
+    #[test]
+    fn test_resolve_config_path() {
+        let explicit = Some(PathBuf::from("custom.yaml"));
+        let (path, exists) = resolve_config_path(explicit);
+        assert_eq!(path, PathBuf::from("custom.yaml"));
+        assert!(exists);
+
+        let (path, _) = resolve_config_path(None);
+        assert_eq!(path, PathBuf::from(".cobbler.yaml"));
     }
 
     #[test]
@@ -224,9 +348,19 @@ fn entry_instance(entry: &ServiceInfo) -> String {
         .to_string()
 }
 
-fn run_status(discover_all: bool, mut targets: Vec<String>) -> Result<(), Box<dyn Error>> {
+fn run_status(
+    discover_all: bool,
+    mut targets: Vec<String>,
+    config: &Config,
+) -> Result<(), Box<dyn Error>> {
     if discover_all {
         targets.extend(discover_targets()?);
+    }
+
+    if targets.is_empty() {
+        for node in &config.nodes {
+            targets.push(node.address.clone());
+        }
     }
 
     if targets.is_empty() {
@@ -245,11 +379,20 @@ fn run_status(discover_all: bool, mut targets: Vec<String>) -> Result<(), Box<dy
         let url = resolve_url(&target);
         let status_url = format!("{}/status", url);
 
-        let (status, body) = match client.get(&status_url).send() {
+        let mut request = client.get(&status_url);
+
+        if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
+            if let Some(api_key) = &node.api_key {
+                request = request.header("X-API-Key", api_key);
+            }
+        }
+
+        let (status, body) = match request.send() {
             Ok(resp) => {
                 let status = resp.status().to_string();
                 let body = match resp.json::<serde_json::Value>() {
-                    Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                    Ok(json) => serde_json::to_string_pretty(&json)
+                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
                     Err(_) => "Could not parse response as JSON".to_string(),
                 };
                 (status, body)
@@ -324,7 +467,22 @@ fn resolve_url(target: &str) -> String {
 }
 
 
-fn run_packages(_full_upgrade: bool, targets: Vec<String>) -> Result<(), Box<dyn Error>> {
+fn run_packages(
+    _full_upgrade: bool,
+    mut targets: Vec<String>,
+    config: &Config,
+) -> Result<(), Box<dyn Error>> {
+    if targets.is_empty() {
+        for node in &config.nodes {
+            targets.push(node.address.clone());
+        }
+    }
+
+    if targets.is_empty() {
+        println!("No targets found.");
+        return Ok(());
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(get_default_timeout())
         .build()?;
@@ -336,11 +494,20 @@ fn run_packages(_full_upgrade: bool, targets: Vec<String>) -> Result<(), Box<dyn
         let url = resolve_url(&target);
         let upgrade_url = format!("{}/packages/full-upgrade", url);
 
-        let (status, body) = match client.post(&upgrade_url).send() {
+        let mut request = client.post(&upgrade_url);
+
+        if let Some(node) = config.nodes.iter().find(|n| n.address == target) {
+            if let Some(api_key) = &node.api_key {
+                request = request.header("X-API-Key", api_key);
+            }
+        }
+
+        let (status, body) = match request.send() {
             Ok(resp) => {
                 let status = resp.status().to_string();
                 let body = match resp.json::<serde_json::Value>() {
-                    Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
+                    Ok(json) => serde_json::to_string_pretty(&json)
+                        .unwrap_or_else(|_| "Failed to pretty-print JSON".to_string()),
                     Err(_) => "Upgrade triggered successfully".to_string(),
                 };
                 (status, body)
