@@ -5,9 +5,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use serde::Serialize;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -18,6 +19,23 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const DEFAULT_HTTP_PORT: u16 = 8080;
+
+#[derive(Parser)]
+#[command(name = "cobblerd")]
+#[command(about = "Cobbler daemon", long_about = None)]
+struct Cli {
+    /// Port to listen on. If not specified, the daemon will search for a free port starting from 8080.
+    #[arg(short, long, env = "COBBLER_DAEMON_PORT")]
+    port: Option<u16>,
+
+    /// Hostname to use for mDNS registration. Defaults to the system hostname.
+    #[arg(long, env = "COBBLER_DAEMON_HOSTNAME")]
+    hostname: Option<String>,
+
+    /// Explicit IP address to use for mDNS registration.
+    #[arg(long, env = "COBBLER_DAEMON_IP")]
+    ip: Option<IpAddr>,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -41,12 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let port_env = std::env::var("COBBLER_DAEMON_PORT").ok();
-    let (listener, http_port) = if let Some(port_str) = port_env {
-        let port = port_str.parse::<u16>().map_err(|e| {
-            error!("invalid COBBLER_DAEMON_PORT={port_str:?}: {e}");
-            e
-        })?;
+    let cli = Cli::parse();
+
+    let (listener, http_port) = if let Some(port) = cli.port {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let listener = TcpListener::bind(addr).await.map_err(|e| {
             error!("failed to bind to port {port}: {e}");
@@ -71,8 +86,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let hostname = hostname_or_unknown();
-    let mdns_daemon = register_mdns(http_port, &hostname);
+    let hostname = cli.hostname.unwrap_or_else(|| {
+        gethostname::gethostname().to_string_lossy().into_owned()
+    }).trim_end_matches('.').to_string();
+
+    let mdns_daemon = register_mdns(http_port, &hostname, cli.ip);
 
     let state = AppState {
         is_upgrading: Arc::new(AtomicBool::new(false)),
@@ -249,16 +267,7 @@ fn get_apt_updates() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 }
 
 
-fn hostname_or_unknown() -> String {
-    std::env::var("COBBLER_DAEMON_HOSTNAME")
-        .unwrap_or_else(|_| {
-            gethostname::gethostname().to_string_lossy().into_owned()
-        })
-        .trim_end_matches('.')
-        .to_string()
-}
-
-fn register_mdns(port: u16, hostname: &str) -> Option<ServiceDaemon> {
+fn register_mdns(port: u16, hostname: &str, ip_addr: Option<IpAddr>) -> Option<ServiceDaemon> {
     let daemon = match ServiceDaemon::new() {
         Ok(daemon) => {
             info!("mDNS daemon started");
@@ -280,32 +289,13 @@ fn register_mdns(port: u16, hostname: &str) -> Option<ServiceDaemon> {
     info!("  Host: {}", host_name);
     info!("  Port: {}", port);
 
-    let mut info = match ServiceInfo::new(
-        "_cobbler._tcp.local.",
-        &instance,
-        &host_name,
-        "",
-        port,
-        &properties[..],
-    ) {
-        Ok(info) => {
-            info!("mDNS service info created");
-            info
-        }
-        Err(err) => {
-            error!("FAILED to create mDNS service info: {err}");
-            return None;
-        }
-    };
-
-    if let Ok(ip) = std::env::var("COBBLER_DAEMON_IP") {
-        info!("Using explicit IP from COBBLER_DAEMON_IP: {}", ip);
-        let ip_addr: std::net::IpAddr = ip.parse().expect("invalid COBBLER_DAEMON_IP");
-        info = match ServiceInfo::new(
+    let info = if let Some(ip) = ip_addr {
+        info!("Using explicit IP: {}", ip);
+        match ServiceInfo::new(
             "_cobbler._tcp.local.",
             &instance,
             &host_name,
-            ip_addr,
+            ip,
             port,
             &properties[..],
         ) {
@@ -314,11 +304,26 @@ fn register_mdns(port: u16, hostname: &str) -> Option<ServiceDaemon> {
                 error!("FAILED to create mDNS service info with explicit IP: {err}");
                 return None;
             }
-        };
+        }
     } else {
-        info!("Enabling automatic address discovery");
-        info = info.enable_addr_auto();
-    }
+        match ServiceInfo::new(
+            "_cobbler._tcp.local.",
+            &instance,
+            &host_name,
+            "",
+            port,
+            &properties[..],
+        ) {
+            Ok(info) => {
+                info!("mDNS service info created, enabling automatic address discovery");
+                info.enable_addr_auto()
+            }
+            Err(err) => {
+                error!("FAILED to create mDNS service info: {err}");
+                return None;
+            }
+        }
+    };
 
     if let Err(err) = daemon.register(info) {
         error!("FAILED to register mDNS service: {err}");
@@ -516,5 +521,21 @@ mod tests {
         
         unsafe { std::env::remove_var("COBBLER_DAEMON_PORT"); }
         drop(listener);
+    }
+
+    #[test]
+    fn test_cli_parsing() {
+        let cli = Cli::parse_from(["cobblerd", "--port", "9090", "--hostname", "test-host", "--ip", "1.2.3.4"]);
+        assert_eq!(cli.port, Some(9090));
+        assert_eq!(cli.hostname, Some("test-host".to_string()));
+        assert_eq!(cli.ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_cli_env_vars() {
+        unsafe { std::env::set_var("COBBLER_DAEMON_PORT", "9091"); }
+        let cli = Cli::parse_from(["cobblerd"]);
+        assert_eq!(cli.port, Some(9091));
+        unsafe { std::env::remove_var("COBBLER_DAEMON_PORT"); }
     }
 }

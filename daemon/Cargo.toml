@@ -7,6 +7,7 @@ edition = "2024"
 apt-pkg-native = "0.3.3"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 axum = "0.7"
 gethostname = "0.5"
 mdns-sd = "0.9.3"
