@@ -13,7 +13,12 @@ const SERVICE_DOMAIN: &str = "local.";
 fn get_default_timeout() -> Duration {
     std::env::var("COBBLER_TIMEOUT")
         .ok()
-        .and_then(|v| humantime::parse_duration(&v).ok())
+        .and_then(|v| {
+            v.parse::<u64>()
+                .map(Duration::from_secs)
+                .ok()
+                .or_else(|| humantime::parse_duration(&v).ok())
+        })
         .unwrap_or(Duration::from_secs(60))
 }
 
@@ -29,9 +34,9 @@ struct Cli {
 enum Commands {
     /// Discover cobbler daemons on the local network
     Discover {
-        /// Time to wait for responses
-        #[arg(short, long, default_value = "60s", env = "COBBLER_TIMEOUT", value_parser = humantime::parse_duration)]
-        timeout: Duration,
+        /// Time to wait for responses in seconds
+        #[arg(short, long, default_value = "5", env = "COBBLER_TIMEOUT")]
+        timeout: u64,
     },
     /// Show status of cobbler daemons
     Status {
@@ -58,7 +63,7 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Discover { timeout } => run_discover(timeout),
+        Commands::Discover { timeout } => run_discover(Duration::from_secs(timeout)),
         Commands::Status { all, targets } => run_status(all, targets),
         Commands::Packages {
             full_upgrade,
@@ -73,6 +78,7 @@ fn main() {
 }
 
 fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
+    println!("Discovery will take {} seconds", timeout.as_secs());
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!(
         "{}.{}",
@@ -84,8 +90,11 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
         .map_err(|err| format!("browse: {err}"))?;
 
     let deadline = Instant::now() + timeout;
-    let mut results: Vec<ServiceInfo> = Vec::new();
     let mut seen = HashSet::new();
+    let mut header_printed = false;
+
+    let stdout = io::stdout();
+    let mut writer = TabWriter::new(stdout).padding(2);
 
     loop {
         let now = Instant::now();
@@ -97,14 +106,23 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
         match receiver.recv_timeout(remaining) {
             Ok(event) => {
                 match event {
-                    ServiceEvent::ServiceFound(service_type, fullname) => {
-                        eprintln!("Found new service: {} (type: {})", fullname, service_type);
-                    }
                     ServiceEvent::ServiceResolved(info) => {
-                        eprintln!("Resolved service: {}", info.get_fullname());
                         let fullname = info.get_fullname().to_string();
                         if seen.insert(fullname) {
-                            results.push(info);
+                            if !header_printed {
+                                writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tINSTANCE")?;
+                                header_printed = true;
+                            }
+                            writeln!(
+                                writer,
+                                "{}\t{}\t{}\t{}\t{}",
+                                entry_id(&info),
+                                entry_host(&info),
+                                entry_addresses(&info),
+                                info.get_port(),
+                                entry_instance(&info)
+                            )?;
+                            writer.flush()?;
                         }
                     }
                     ServiceEvent::SearchStopped(service_type) => {
@@ -122,30 +140,50 @@ fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
 
     let _ = mdns.shutdown();
 
-    if results.is_empty() {
+    if !header_printed {
         println!("No cobbler daemons found.");
-        return Ok(());
     }
-
-    results.sort_by(|a, b| entry_instance(a).cmp(&entry_instance(b)));
-
-    let stdout = io::stdout();
-    let mut writer = TabWriter::new(stdout).padding(2);
-    writeln!(writer, "ID\tHOST\tADDRESS\tPORT\tINSTANCE")?;
-    for entry in results {
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{}",
-            entry_id(&entry),
-            entry_host(&entry),
-            entry_addresses(&entry),
-            entry.get_port(),
-            entry_instance(&entry)
-        )?;
-    }
-    writer.flush()?;
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parse_discover_default() {
+        let cli = Cli::parse_from(&["cobbler", "discover"]);
+        if let Commands::Discover { timeout } = cli.command {
+            assert_eq!(timeout, 5);
+        } else {
+            panic!("Wrong command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_discover_timeout() {
+        let cli = Cli::parse_from(&["cobbler", "discover", "-t", "10"]);
+        if let Commands::Discover { timeout } = cli.command {
+            assert_eq!(timeout, 10);
+        } else {
+            panic!("Wrong command");
+        }
+    }
+
+    #[test]
+    fn test_get_default_timeout() {
+        std::env::set_var("COBBLER_TIMEOUT", "15");
+        assert_eq!(get_default_timeout(), Duration::from_secs(15));
+
+        std::env::set_var("COBBLER_TIMEOUT", "1m");
+        assert_eq!(get_default_timeout(), Duration::from_secs(60));
+
+        std::env::remove_var("COBBLER_TIMEOUT");
+        assert_eq!(get_default_timeout(), Duration::from_secs(60));
+    }
 }
 
 
