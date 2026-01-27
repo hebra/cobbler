@@ -1,8 +1,9 @@
+use clap::{Parser, Subcommand};
+use flume::RecvTimeoutError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashSet;
 use std::error::Error;
 use std::io::{self, Write};
-use flume::RecvTimeoutError;
 use std::time::{Duration, Instant};
 use tabwriter::TabWriter;
 
@@ -16,87 +17,62 @@ fn get_default_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(60))
 }
 
+#[derive(Parser)]
+#[command(name = "cobbler")]
+#[command(about = "A CLI tool for cobbler", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Discover cobbler daemons on the local network
+    Discover {
+        /// Time to wait for responses
+        #[arg(short, long, default_value = "60s", env = "COBBLER_TIMEOUT", value_parser = humantime::parse_duration)]
+        timeout: Duration,
+    },
+    /// Show status of cobbler daemons
+    Status {
+        /// Get status for all discovered cobbler daemons
+        #[arg(short, long)]
+        all: bool,
+
+        /// Targets (host:port)
+        targets: Vec<String>,
+    },
+    /// Manage packages on cobbler daemons
+    Packages {
+        /// Perform a full system upgrade
+        #[arg(long, required = true)]
+        full_upgrade: bool,
+
+        /// Targets (host:port)
+        #[arg(required = true, num_args = 1..)]
+        targets: Vec<String>,
+    },
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    if args.len() < 2 {
-        print_help();
-        return;
-    }
+    let result = match cli.command {
+        Commands::Discover { timeout } => run_discover(timeout),
+        Commands::Status { all, targets } => run_status(all, targets),
+        Commands::Packages {
+            full_upgrade,
+            targets,
+        } => run_packages(full_upgrade, targets),
+    };
 
-    match args[1].as_str() {
-        "help" => run_help(&args[2..]),
-        "discover" => {
-            if let Err(err) = run_discover(&args[2..]) {
-                eprintln!("discover: {err}");
-                std::process::exit(1);
-            }
-        }
-        "status" => {
-            if let Err(err) = run_status(&args[2..]) {
-                eprintln!("status: {err}");
-                std::process::exit(1);
-            }
-        }
-        "packages" => {
-            if let Err(err) = run_packages(&args[2..]) {
-                eprintln!("packages: {err}");
-                std::process::exit(1);
-            }
-        }
-        other => {
-            eprintln!("unknown command: {other}");
-            eprintln!();
-            print_help();
-            std::process::exit(1);
-        }
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }
 
-fn run_help(args: &[String]) {
-    if args.is_empty() {
-        print_help();
-        return;
-    }
-
-    match args[0].as_str() {
-        "discover" => {
-            let mut out = io::stdout();
-            print_discover_help(&mut out);
-        }
-        "status" => {
-            let mut out = io::stdout();
-            print_status_help(&mut out);
-        }
-        "packages" => {
-            let mut out = io::stdout();
-            print_packages_help(&mut out);
-        }
-        "help" => print_help(),
-        other => {
-            eprintln!("unknown command: {other}");
-            eprintln!();
-            print_help();
-            std::process::exit(1);
-        }
-    }
-}
-
-fn print_help() {
-    println!("Usage: cobbler <command> [options]");
-    println!();
-    println!("Commands:");
-    println!("  help [command]  Show help for a command");
-    println!("  discover        Discover cobbler daemons on the local network");
-    println!("  status          Show status of cobbler daemons");
-    println!("  packages        Manage packages on cobbler daemons");
-    println!();
-    println!("Run `cobbler help <command>` for details.");
-}
-
-fn run_discover(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let timeout = parse_discover_args(args)?;
-
+fn run_discover(timeout: Duration) -> Result<(), Box<dyn Error>> {
     let mdns = ServiceDaemon::new().map_err(|err| format!("create resolver: {err}"))?;
     let service_name = format!(
         "{}.{}",
@@ -172,50 +148,6 @@ fn run_discover(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn parse_discover_args(args: &[String]) -> Result<Duration, Box<dyn Error>> {
-    let mut timeout = get_default_timeout();
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "-timeout" | "--timeout" => {
-                if idx + 1 >= args.len() {
-                    return Err("missing value for -timeout".into());
-                }
-                timeout = humantime::parse_duration(&args[idx + 1])?;
-                idx += 2;
-            }
-            "-h" | "--help" => {
-                let mut out = io::stderr();
-                print_discover_help(&mut out);
-                return Err("help requested".into());
-            }
-            other => {
-                return Err(format!("unknown flag: {other}").into());
-            }
-        }
-    }
-
-    Ok(timeout)
-}
-
-fn print_discover_help(out: &mut dyn Write) {
-    writeln!(out, "Usage: cobbler discover [options]").ok();
-    writeln!(out).ok();
-    writeln!(
-        out,
-        "Discovers services advertised as {} in {}.",
-        SERVICE_TYPE, SERVICE_DOMAIN
-    )
-    .ok();
-    writeln!(out).ok();
-    writeln!(out, "Options:").ok();
-    writeln!(
-        out,
-        "  -timeout duration   time to wait for responses (default 60s)"
-    )
-    .ok();
-    writeln!(out, "                      The default can be overridden with COBBLER_TIMEOUT.").ok();
-}
 
 fn entry_id(entry: &ServiceInfo) -> String {
     let props = entry.get_properties();
@@ -254,37 +186,7 @@ fn entry_instance(entry: &ServiceInfo) -> String {
         .to_string()
 }
 
-fn run_status(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut targets = Vec::new();
-    let mut discover_all = false;
-
-    if args.is_empty() {
-        let mut out = io::stderr();
-        print_status_help(&mut out);
-        return Ok(());
-    }
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-a" | "--all" => {
-                discover_all = true;
-            }
-            "-h" | "--help" => {
-                let mut out = io::stdout();
-                print_status_help(&mut out);
-                return Ok(());
-            }
-            target if !target.starts_with('-') => {
-                targets.push(target.to_string());
-            }
-            other => {
-                return Err(format!("unknown option: {other}").into());
-            }
-        }
-        i += 1;
-    }
-
+fn run_status(discover_all: bool, mut targets: Vec<String>) -> Result<(), Box<dyn Error>> {
     if discover_all {
         targets.extend(discover_targets()?);
     }
@@ -383,60 +285,8 @@ fn resolve_url(target: &str) -> String {
     }
 }
 
-fn print_status_help(out: &mut dyn Write) {
-    writeln!(out, "Usage: cobbler status [options] [host:port]").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Options:").unwrap();
-    writeln!(out, "  -a, --all    Get status for all discovered cobbler daemons").unwrap();
-    writeln!(out, "  -h, --help   Show this help message").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Environment variables:").unwrap();
-    writeln!(out, "  COBBLER_TIMEOUT  Default timeout for network operations (default 60s)").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Examples:").unwrap();
-    writeln!(out, "  cobbler status -a").unwrap();
-    writeln!(out, "  cobbler status localhost:8080").unwrap();
-}
 
-fn run_packages(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut targets = Vec::new();
-    let mut full_upgrade = false;
-
-    if args.is_empty() {
-        let mut out = io::stderr();
-        print_packages_help(&mut out);
-        return Ok(());
-    }
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--full-upgrade" => {
-                full_upgrade = true;
-            }
-            "-h" | "--help" => {
-                let mut out = io::stdout();
-                print_packages_help(&mut out);
-                return Ok(());
-            }
-            target if !target.starts_with('-') => {
-                targets.push(target.to_string());
-            }
-            other => {
-                return Err(format!("unknown option: {other}").into());
-            }
-        }
-        i += 1;
-    }
-
-    if !full_upgrade {
-        return Err("missing required option: --full-upgrade".into());
-    }
-
-    if targets.is_empty() {
-        return Err("missing daemon endpoint".into());
-    }
-
+fn run_packages(_full_upgrade: bool, targets: Vec<String>) -> Result<(), Box<dyn Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(get_default_timeout())
         .build()?;
@@ -471,13 +321,3 @@ fn run_packages(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn print_packages_help(out: &mut dyn Write) {
-    writeln!(out, "Usage: cobbler packages [options] [host:port]").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Options:").unwrap();
-    writeln!(out, "  --full-upgrade    Perform a full system upgrade (apt full-upgrade -y)").unwrap();
-    writeln!(out, "  -h, --help        Show this help message").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "Examples:").unwrap();
-    writeln!(out, "  cobbler packages --full-upgrade sam.local:8081").unwrap();
-}

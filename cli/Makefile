@@ -8,7 +8,7 @@ build:
 	cargo build
 
 run:
-	cargo run --bin $(BINARY)
+	cargo run
 
 test:
 	cargo test

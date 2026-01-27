@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4", features = ["derive", "env"] }
 humantime = "2.1"
 flume = "0.10"
 mdns-sd = "0.9"
