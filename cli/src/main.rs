@@ -12,6 +12,7 @@ use tabwriter::TabWriter;
 
 const SERVICE_TYPE: &str = "_cobbler._tcp";
 const SERVICE_DOMAIN: &str = "local.";
+const TOKEN_PLACEHOLDER: &str = "REPLACE_WITH_ACTUAL_TOKEN";
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 struct Config {
@@ -54,6 +55,48 @@ fn save_config(path: &Path, config: &Config) -> Result<(), Box<dyn Error>> {
     let content = serde_yaml::to_string(config)?;
     fs::write(path, content)?;
     Ok(())
+}
+
+fn merge_nodes(config: &mut Config, discovered: Vec<(String, String)>) -> bool {
+    let mut updated = false;
+    for (addr, id) in discovered {
+        let new_name = if id.is_empty() { None } else { Some(id) };
+
+        // Try finding by name first if name is available
+        let mut found_index = None;
+        if let Some(ref name) = new_name {
+            found_index = config.nodes.iter().position(|n| n.name.as_ref() == Some(name));
+        }
+
+        // If not found by name, try finding by address
+        if found_index.is_none() {
+            found_index = config.nodes.iter().position(|n| n.address == addr);
+        }
+
+        if let Some(index) = found_index {
+            let node = &mut config.nodes[index];
+            let mut node_updated = false;
+            if node.address != addr {
+                node.address = addr;
+                node_updated = true;
+            }
+            if node.name != new_name {
+                node.name = new_name;
+                node_updated = true;
+            }
+            if node_updated {
+                updated = true;
+            }
+        } else {
+            config.nodes.push(NodeConfig {
+                name: new_name,
+                address: addr,
+                api_key: Some(TOKEN_PLACEHOLDER.to_string()),
+            });
+            updated = true;
+        }
+    }
+    updated
 }
 
 fn get_default_timeout() -> Duration {
@@ -171,7 +214,7 @@ fn run_discover(
     let deadline = Instant::now() + timeout;
     let mut seen = HashSet::new();
     let mut header_printed = false;
-    let mut discovered_addresses = Vec::new();
+    let mut discovered_nodes = Vec::new();
 
     let stdout = io::stdout();
     let mut writer = TabWriter::new(stdout).padding(2);
@@ -203,8 +246,11 @@ fn run_discover(
                         )?;
                         writer.flush()?;
 
-                        for addr in info.get_addresses() {
-                            discovered_addresses.push(format!("{}:{}", addr, info.get_port()));
+                        if let Some(addr) = info.get_addresses().iter().next() {
+                            discovered_nodes.push((
+                                format!("{}:{}", addr, info.get_port()),
+                                entry_id(&info),
+                            ));
                         }
                     }
                 }
@@ -228,18 +274,7 @@ fn run_discover(
 
     if update_config {
         let mut config = load_config(config_path)?;
-        let mut updated = false;
-        for addr in discovered_addresses {
-            if !config.nodes.iter().any(|n| n.address == addr) {
-                config.nodes.push(NodeConfig {
-                    name: None,
-                    address: addr,
-                    api_key: None,
-                });
-                updated = true;
-            }
-        }
-        if updated {
+        if merge_nodes(&mut config, discovered_nodes) {
             save_config(config_path, &config)?;
             println!("Configuration updated: {}", config_path.display());
         } else {
@@ -308,14 +343,129 @@ mod tests {
         std::env::remove_var("COBBLER_TIMEOUT");
         assert_eq!(get_default_timeout(), Duration::from_secs(60));
     }
+
+    #[test]
+    fn test_merge_nodes() {
+        let mut config = Config {
+            nodes: vec![NodeConfig {
+                name: None,
+                address: "1.1.1.1:8080".to_string(),
+                api_key: None,
+            }],
+        };
+
+        let discovered = vec![
+            ("1.1.1.1:8080".to_string(), "node1".to_string()),
+            ("2.2.2.2:8080".to_string(), "node2".to_string()),
+        ];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        assert_eq!(config.nodes.len(), 2);
+        
+        // Existing node updated with name
+        assert_eq!(config.nodes[0].address, "1.1.1.1:8080");
+        assert_eq!(config.nodes[0].name, Some("node1".to_string()));
+        assert_eq!(config.nodes[0].api_key, None);
+
+        // New node added with name and placeholder token
+        assert_eq!(config.nodes[1].address, "2.2.2.2:8080");
+        assert_eq!(config.nodes[1].name, Some("node2".to_string()));
+        assert_eq!(config.nodes[1].api_key, Some(TOKEN_PLACEHOLDER.to_string()));
+    }
+
+    #[test]
+    fn test_merge_nodes_updates_name_but_preserves_token() {
+        let mut config = Config {
+            nodes: vec![NodeConfig {
+                name: Some("OldName".to_string()),
+                address: "1.1.1.1:8080".to_string(),
+                api_key: Some("secret".to_string()),
+            }],
+        };
+
+        let discovered = vec![("1.1.1.1:8080".to_string(), "NewName".to_string())];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        assert_eq!(config.nodes[0].name, Some("NewName".to_string()));
+        assert_eq!(config.nodes[0].api_key, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn test_merge_nodes_updates_custom_name() {
+        let mut config = Config {
+            nodes: vec![NodeConfig {
+                name: Some("Custom".to_string()),
+                address: "1.1.1.1:8080".to_string(),
+                api_key: None,
+            }],
+        };
+
+        let discovered = vec![("1.1.1.1:8080".to_string(), "node1".to_string())];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        assert_eq!(config.nodes[0].name, Some("node1".to_string()));
+    }
+
+    #[test]
+    fn test_merge_nodes_cleans_id_prefix_from_config() {
+        let mut config = Config {
+            nodes: vec![NodeConfig {
+                name: Some("id=raspi1".to_string()),
+                address: "1.1.1.1:8080".to_string(),
+                api_key: None,
+            }],
+        };
+
+        // Discovered node has the clean name
+        let discovered = vec![("1.1.1.1:8080".to_string(), "raspi1".to_string())];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        assert_eq!(config.nodes[0].name, Some("raspi1".to_string()));
+    }
+
+    #[test]
+    fn test_merge_nodes_prevents_duplicate_by_name() {
+        let mut config = Config {
+            nodes: vec![NodeConfig {
+                name: Some("raspi1".to_string()),
+                address: "1.1.1.1:8080".to_string(),
+                api_key: Some("secret".to_string()),
+            }],
+        };
+
+        // raspi1 changed IP
+        let discovered = vec![("1.1.1.2:8080".to_string(), "raspi1".to_string())];
+
+        let updated = merge_nodes(&mut config, discovered);
+        assert!(updated);
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(config.nodes[0].address, "1.1.1.2:8080");
+        assert_eq!(config.nodes[0].name, Some("raspi1".to_string()));
+        assert_eq!(config.nodes[0].api_key, Some("secret".to_string()));
+    }
+
+    #[test]
+    fn test_clean_node_id() {
+        assert_eq!(clean_node_id("id=raspi1"), "raspi1");
+        assert_eq!(clean_node_id("raspi1"), "raspi1");
+        assert_eq!(clean_node_id(""), "");
+    }
 }
 
+
+fn clean_node_id(id: &str) -> &str {
+    id.strip_prefix("id=").unwrap_or(id)
+}
 
 fn entry_id(entry: &ServiceInfo) -> String {
     let props = entry.get_properties();
     props
         .get("id")
-        .map(|value| value.to_string())
+        .map(|value| clean_node_id(&value.to_string()).to_string())
         .unwrap_or_default()
 }
 
