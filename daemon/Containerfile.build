@@ -5,11 +5,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libapt-pkg-dev \
     pkg-config \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install.sh | sh
-RUN cargo binstall -y cargo-deb
+RUN cargo install cargo-deb --locked
 
 COPY . .
 WORKDIR /app/daemon
