@@ -1,0 +1,44 @@
+name: Build Daemon
+
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: aarch64
+            platform: linux/arm64
+          - arch: armhf
+            platform: linux/arm/v7
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and package
+        run: |
+          mkdir -p dist/${{ matrix.arch }}
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --file daemon/Containerfile.build \
+            --output type=local,dest=dist/${{ matrix.arch }} \
+            .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cobblerd-${{ matrix.arch }}-deb
+          path: dist/${{ matrix.arch }}/*.deb
